@@ -23,13 +23,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path"
 	"sort"
 	"strings"
 
-	"github.com/xenolf/lego/lego"
-	"github.com/xenolf/lego/registration"
+	"github.com/go-acme/lego/v3/acme"
+	"github.com/go-acme/lego/v3/registration"
 )
 
 // user represents a Let's Encrypt user account.
@@ -59,8 +60,8 @@ func (u user) GetPrivateKey() crypto.PrivateKey {
 // user to disk or register it via ACME. If you want to use
 // a user account that might already exist, call getUser
 // instead. It does NOT prompt the user.
-func (cfg *Config) newUser(email string) (user, error) {
-	user := user{Email: email}
+func (cfg *Config) newUser(email string) (*user, error) {
+	user := &user{Email: email}
 	privateKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	if err != nil {
 		return user, fmt.Errorf("generating private key: %v", err)
@@ -71,81 +72,89 @@ func (cfg *Config) newUser(email string) (user, error) {
 
 // getEmail does everything it can to obtain an email address
 // from the user within the scope of memory and storage to use
-// for ACME TLS. If it cannot get an email address, it returns
-// empty string. (If user is present, it will warn the user of
+// for ACME TLS. If it cannot get an email address, it does nothing
+// (If user is prompted, it will warn the user of
 // the consequences of an empty email.) This function MAY prompt
-// the user for input. If userPresent is false, the operator
+// the user for input. If allowPrompts is false, the user
 // will NOT be prompted and an empty email may be returned.
-// If the user is prompted, a new User will be created and
-// stored in storage according to the email address they
-// provided (which might be blank).
-func (cfg *Config) getEmail(userPresent bool) (string, error) {
-	// First try memory
+func (cfg *Config) getEmail(allowPrompts bool) error {
 	leEmail := cfg.Email
+
+	// First try package default email
 	if leEmail == "" {
-		leEmail = Email
+		leEmail = Default.Email
 	}
 
 	// Then try to get most recent user email from storage
+	var gotRecentEmail bool
 	if leEmail == "" {
-		leEmail = cfg.mostRecentUserEmail()
-		cfg.Email = leEmail // save for next time
+		leEmail, gotRecentEmail = cfg.mostRecentUserEmail()
+	}
+	if !gotRecentEmail && leEmail == "" && allowPrompts {
+		// Looks like there is no email address readily available,
+		// so we will have to ask the user if we can.
+		var err error
+		leEmail, err = cfg.promptUserForEmail()
+		if err != nil {
+			return err
+		}
+
+		// User might have just signified their agreement
+		cfg.Agreed = Default.Agreed
 	}
 
-	// Looks like there is no email address readily available,
-	// so we will have to ask the user if we can.
-	if leEmail == "" && userPresent {
-		// evidently, no User data was present in storage;
-		// thus we must make a new User so that we can get
-		// the Terms of Service URL via our ACME client, phew!
-		user, err := cfg.newUser("")
-		if err != nil {
-			return "", err
-		}
+	// save the email for later and ensure it is consistent
+	// for repeated use; then update cfg with the email
+	Default.Email = strings.TrimSpace(strings.ToLower(leEmail))
+	cfg.Email = Default.Email
 
-		// get the agreement URL
-		agreementURL := agreementTestURL
-		if agreementURL == "" {
-			// we call acme.NewClient directly because newACMEClient
-			// would require that we already know the user's email
-			caURL := CA
-			if cfg.CA != "" {
-				caURL = cfg.CA
-			}
-			legoConfig := lego.NewConfig(user)
-			legoConfig.CADirURL = caURL
-			legoConfig.UserAgent = UserAgent
-			tempClient, err := lego.NewClient(legoConfig)
-			if err != nil {
-				return "", fmt.Errorf("making ACME client to get ToS URL: %v", err)
-			}
-			agreementURL = tempClient.GetToSURL()
-		}
+	return nil
+}
 
-		// prompt the user for an email address and terms agreement
-		reader := bufio.NewReader(stdin)
-		cfg.promptUserAgreement(agreementURL)
-		fmt.Println("Please enter your email address to signify agreement and to be notified")
-		fmt.Println("in case of issues. You can leave it blank, but we don't recommend it.")
-		fmt.Print("  Email address: ")
-		leEmail, err = reader.ReadString('\n')
-		if err != nil && err != io.EOF {
-			return "", fmt.Errorf("reading email address: %v", err)
-		}
-		leEmail = strings.TrimSpace(leEmail)
-		cfg.Email = leEmail
-		cfg.Agreed = true
-
-		// save the new user to preserve this for next time
-		user.Email = leEmail
-		err = cfg.saveUser(user)
-		if err != nil {
-			return "", err
-		}
+func (cfg *Config) getAgreementURL() (string, error) {
+	if agreementTestURL != "" {
+		return agreementTestURL, nil
 	}
+	caURL := Default.CA
+	if cfg.CA != "" {
+		caURL = cfg.CA
+	}
+	response, err := http.Get(caURL)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	var dir acme.Directory
+	err = json.NewDecoder(response.Body).Decode(&dir)
+	if err != nil {
+		return "", err
+	}
+	return dir.Meta.TermsOfService, nil
+}
 
-	// lower-casing the email is important for consistency
-	return strings.ToLower(leEmail), nil
+// promptUserForEmail prompts the user for an email address
+// and returns the email address they entered (which could
+// be the empty string). If no error is returned, then Agreed
+// will also be set to true, since continuing through the
+// prompt signifies agreement.
+func (cfg *Config) promptUserForEmail() (string, error) {
+	agreementURL, err := cfg.getAgreementURL()
+	if err != nil {
+		return "", fmt.Errorf("get Agreement URL: %v", err)
+	}
+	// prompt the user for an email address and terms agreement
+	reader := bufio.NewReader(stdin)
+	cfg.promptUserAgreement(agreementURL)
+	fmt.Println("Please enter your email address to signify agreement and to be notified")
+	fmt.Println("in case of issues. You can leave it blank, but we don't recommend it.")
+	fmt.Print("  Email address: ")
+	leEmail, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", fmt.Errorf("reading email address: %v", err)
+	}
+	leEmail = strings.TrimSpace(leEmail)
+	Default.Agreed = true
+	return leEmail, nil
 }
 
 // getUser loads the user with the given email from disk
@@ -153,32 +162,31 @@ func (cfg *Config) getEmail(userPresent bool) (string, error) {
 // it will create a new one, but it does NOT save new
 // users to the disk or register them via ACME. It does
 // NOT prompt the user.
-func (cfg *Config) getUser(email string) (user, error) {
-	var user user
-
-	regBytes, err := cfg.certCache.storage.Load(StorageKeys.UserReg(cfg.CA, email))
+func (cfg *Config) getUser(email string) (*user, error) {
+	regBytes, err := cfg.Storage.Load(StorageKeys.UserReg(cfg.CA, email))
 	if err != nil {
 		if _, ok := err.(ErrNotExist); ok {
 			// create a new user
 			return cfg.newUser(email)
 		}
-		return user, err
+		return nil, err
 	}
-	keyBytes, err := cfg.certCache.storage.Load(StorageKeys.UserPrivateKey(cfg.CA, email))
+	keyBytes, err := cfg.Storage.Load(StorageKeys.UserPrivateKey(cfg.CA, email))
 	if err != nil {
 		if _, ok := err.(ErrNotExist); ok {
 			// create a new user
 			return cfg.newUser(email)
 		}
-		return user, err
+		return nil, err
 	}
 
-	err = json.Unmarshal(regBytes, &user)
+	var u *user
+	err = json.Unmarshal(regBytes, &u)
 	if err != nil {
-		return user, err
+		return u, err
 	}
-	user.key, err = decodePrivateKey(keyBytes)
-	return user, err
+	u.key, err = decodePrivateKey(keyBytes)
+	return u, err
 }
 
 // saveUser persists a user's key and account registration
@@ -186,7 +194,7 @@ func (cfg *Config) getUser(email string) (user, error) {
 // or prompt the user. You must also pass in the storage
 // wherein the user should be saved. It should be the storage
 // for the CA with which user has an account.
-func (cfg *Config) saveUser(user user) error {
+func (cfg *Config) saveUser(user *user) error {
 	regBytes, err := json.MarshalIndent(&user, "", "\t")
 	if err != nil {
 		return err
@@ -207,7 +215,7 @@ func (cfg *Config) saveUser(user user) error {
 		},
 	}
 
-	return storeTx(cfg.certCache.storage, all)
+	return storeTx(cfg.Storage, all)
 }
 
 // promptUserAgreement simply outputs the standard user
@@ -240,21 +248,21 @@ func (cfg *Config) askUserAgreement(agreementURL string) bool {
 // in s. Since this is part of a complex sequence to get a user
 // account, errors here are discarded to simplify code flow in
 // the caller, and errors are not important here anyway.
-func (cfg *Config) mostRecentUserEmail() string {
-	userList, err := cfg.certCache.storage.List(StorageKeys.UsersPrefix(cfg.CA), false)
+func (cfg *Config) mostRecentUserEmail() (string, bool) {
+	userList, err := cfg.Storage.List(StorageKeys.UsersPrefix(cfg.CA), false)
 	if err != nil || len(userList) == 0 {
-		return ""
+		return "", false
 	}
 	sort.Slice(userList, func(i, j int) bool {
-		iInfo, _ := cfg.certCache.storage.Stat(userList[i])
-		jInfo, _ := cfg.certCache.storage.Stat(userList[j])
+		iInfo, _ := cfg.Storage.Stat(userList[i])
+		jInfo, _ := cfg.Storage.Stat(userList[j])
 		return jInfo.Modified.Before(iInfo.Modified)
 	})
 	user, err := cfg.getUser(path.Base(userList[0]))
 	if err != nil {
-		return ""
+		return "", false
 	}
-	return user.Email
+	return user.Email, true
 }
 
 // agreementTestURL is set during tests to skip requiring

@@ -19,20 +19,16 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"os"
-
-	"github.com/xenolf/lego/registration"
+	"github.com/go-acme/lego/v3/registration"
 )
 
 func TestUser(t *testing.T) {
-	defer os.RemoveAll(testStorageDir)
-
 	privateKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	if err != nil {
 		t.Fatalf("Could not generate test private key: %v", err)
@@ -53,8 +49,13 @@ func TestUser(t *testing.T) {
 		t.Errorf("Expected the private key at address %p but got one at %p instead ", expected, actual)
 	}
 }
-
 func TestNewUser(t *testing.T) {
+	testConfig := &Config{
+		CA:        "https://example.com/acme/directory",
+		Storage:   &FileStorage{Path: "./_testdata_tmp"},
+		certCache: new(Cache),
+	}
+
 	email := "me@foobar.com"
 	user, err := testConfig.newUser(email)
 	if err != nil {
@@ -72,6 +73,12 @@ func TestNewUser(t *testing.T) {
 }
 
 func TestSaveUser(t *testing.T) {
+	testConfig := &Config{
+		CA:        "https://example.com/acme/directory",
+		Storage:   &FileStorage{Path: "./_testdata1_tmp"},
+		certCache: new(Cache),
+	}
+	testStorageDir := testConfig.Storage.(*FileStorage).Path
 	defer os.RemoveAll(testStorageDir)
 
 	email := "me@foobar.com"
@@ -91,7 +98,11 @@ func TestSaveUser(t *testing.T) {
 }
 
 func TestGetUserDoesNotAlreadyExist(t *testing.T) {
-	defer os.RemoveAll(testStorageDir)
+	testConfig := &Config{
+		CA:        "https://example.com/acme/directory",
+		Storage:   &FileStorage{Path: "./_testdata_tmp"},
+		certCache: new(Cache),
+	}
 
 	user, err := testConfig.getUser("user_does_not_exist@foobar.com")
 	if err != nil {
@@ -104,6 +115,12 @@ func TestGetUserDoesNotAlreadyExist(t *testing.T) {
 }
 
 func TestGetUserAlreadyExists(t *testing.T) {
+	testConfig := &Config{
+		CA:        "https://example.com/acme/directory",
+		Storage:   &FileStorage{Path: "./_testdata2_tmp"},
+		certCache: new(Cache),
+	}
+	testStorageDir := testConfig.Storage.(*FileStorage).Path
 	defer os.RemoveAll(testStorageDir)
 
 	email := "me@foobar.com"
@@ -135,46 +152,69 @@ func TestGetUserAlreadyExists(t *testing.T) {
 	}
 }
 
-func TestGetEmail(t *testing.T) {
-	agreementTestURL = "(none - testing)"
-	defer func() { agreementTestURL = "" }()
+func TestGetEmailFromPackageDefault(t *testing.T) {
+	Default.Email = "tEsT2@foo.com"
+	defer func() {
+		Default.Email = ""
+	}()
+
+	testConfig := &Config{
+		CA:        "https://example.com/acme/directory",
+		Storage:   &FileStorage{Path: "./_testdata_tmp"},
+		certCache: new(Cache),
+	}
+
+	err := testConfig.getEmail(true)
+	if err != nil {
+		t.Fatalf("getEmail error: %v", err)
+	}
+	lowerEmail := strings.ToLower(Default.Email)
+	if testConfig.Email != lowerEmail {
+		t.Errorf("Did not get correct email from memory; expected '%s' but got '%s'", lowerEmail, testConfig.Email)
+	}
+}
+
+func TestGetEmailFromUserInput(t *testing.T) {
+	testConfig := &Config{
+		CA:        "https://example.com/acme/directory",
+		Storage:   &FileStorage{Path: "./_testdata3_tmp"},
+		certCache: new(Cache),
+	}
 
 	// let's not clutter up the output
 	origStdout := os.Stdout
 	os.Stdout = nil
-	defer func() { os.Stdout = origStdout }()
+	agreementTestURL = "(none - testing)"
+	defer func() {
+		os.Stdout = origStdout
+		agreementTestURL = ""
+	}()
 
+	email := "test3@foo.com"
+	stdin = bytes.NewBufferString(email + "\n")
+	err := testConfig.getEmail(true)
+	if err != nil {
+		t.Fatalf("getEmail error: %v", err)
+	}
+	if testConfig.Email != email {
+		t.Errorf("Did not get correct email from user input prompt; expected '%s' but got '%s'", email, testConfig.Email)
+	}
+	if !testConfig.Agreed {
+		t.Error("Expect Config.Agreed to be true, but got false")
+	}
+}
+
+func TestGetEmailFromRecent(t *testing.T) {
+	testConfig := &Config{
+		CA:        "https://example.com/acme/directory",
+		Storage:   &FileStorage{Path: "./_testdata4_tmp"},
+		certCache: new(Cache),
+	}
+	testStorageDir := testConfig.Storage.(*FileStorage).Path
 	defer os.RemoveAll(testStorageDir)
-	Email = "test2@foo.com"
 
-	// Test1: Use default email (or user previously providing it)
-	actual, err := testConfig.getEmail(true)
-	if err != nil {
-		t.Fatalf("getEmail (1) error: %v", err)
-	}
-	if actual != Email {
-		t.Errorf("Did not get correct email from memory; expected '%s' but got '%s'", Email, actual)
-	}
+	Default.Email = ""
 
-	// Test2: Get input from user
-	Email = ""
-	stdin = new(bytes.Buffer)
-	_, err = io.Copy(stdin, strings.NewReader("test3@foo.com\n"))
-	if err != nil {
-		t.Fatalf("Could not simulate user input, error: %v", err)
-	}
-	actual, err = testConfig.getEmail(true)
-	if err != nil {
-		t.Fatalf("getEmail (2) error: %v", err)
-	}
-	if actual != "test3@foo.com" {
-		t.Errorf("Did not get correct email from user input prompt; expected '%s' but got '%s'", "test3@foo.com", actual)
-	}
-
-	// Test3: Get most recent email from before (in storage)
-	os.RemoveAll(testStorageDir)
-	Email = ""
-	testConfig.Email = ""
 	for i, eml := range []string{
 		"test4-1@foo.com",
 		"test4-2@foo.com",
@@ -190,7 +230,7 @@ func TestGetEmail(t *testing.T) {
 		}
 
 		// Change modified time so they're all different and the test becomes more deterministic
-		fs := testConfig.certCache.storage.(FileStorage)
+		fs := testConfig.Storage.(*FileStorage)
 		userFolder := filepath.Join(fs.Path, StorageKeys.UserPrefix(testConfig.CA, eml))
 		f, err := os.Stat(userFolder)
 		if err != nil {
@@ -201,11 +241,11 @@ func TestGetEmail(t *testing.T) {
 			t.Fatalf("Could not change user folder mod time for '%s': %v", eml, err)
 		}
 	}
-	actual, err = testConfig.getEmail(true)
+	err := testConfig.getEmail(true)
 	if err != nil {
-		t.Fatalf("getEmail (3) error: %v", err)
+		t.Fatalf("getEmail error: %v", err)
 	}
-	if actual != "test4-3@foo.com" {
-		t.Errorf("Did not get correct email from storage; expected '%s' but got '%s'", "test4-3@foo.com", actual)
+	if testConfig.Email != "test4-3@foo.com" {
+		t.Errorf("Did not get correct email from storage; expected '%s' but got '%s'", "test4-3@foo.com", testConfig.Email)
 	}
 }

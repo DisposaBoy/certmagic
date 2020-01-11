@@ -15,7 +15,13 @@
 package certmagic
 
 import (
+	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
 	"log"
+	"path"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ocsp"
@@ -24,35 +30,36 @@ import (
 // maintainAssets is a permanently-blocking function
 // that loops indefinitely and, on a regular schedule, checks
 // certificates for expiration and initiates a renewal of certs
-// that are expiring soon. It also updates OCSP stapling and
-// performs other maintenance of assets. It should only be
-// called once per process.
-//
-// You must pass in the channel which you'll close when
-// maintenance should stop, to allow this goroutine to clean up
-// after itself and unblock. (Not that you HAVE to stop it...)
+// that are expiring soon. It also updates OCSP stapling. It
+// should only be called once per cache.
 func (certCache *Cache) maintainAssets() {
-	renewalTicker := time.NewTicker(certCache.RenewInterval)
-	ocspTicker := time.NewTicker(certCache.OCSPInterval)
+	renewalTicker := time.NewTicker(certCache.options.RenewCheckInterval)
+	ocspTicker := time.NewTicker(certCache.options.OCSPCheckInterval)
+
+	log.Printf("[INFO][cache:%p] Started certificate maintenance routine", certCache)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	for {
 		select {
 		case <-renewalTicker.C:
-			log.Printf("[INFO][%s] Scanning for expiring certificates", certCache.storage)
-			err := certCache.RenewManagedCertificates(false)
+			log.Printf("[INFO][cache:%p] Scanning for expiring certificates", certCache)
+			err := certCache.RenewManagedCertificates(ctx)
 			if err != nil {
-				log.Printf("[ERROR][%s] Renewing managed certificates: %v", certCache.storage, err)
+				log.Printf("[ERROR][cache:%p] Renewing managed certificates: %v", certCache, err)
 			}
-			log.Printf("[INFO][%s] Done scanning certificates", certCache.storage)
+			log.Printf("[INFO][cache:%p] Done scanning certificates", certCache)
 		case <-ocspTicker.C:
-			log.Printf("[INFO][%s] Scanning for stale OCSP staples", certCache.storage)
-			certCache.updateOCSPStaples()
-			certCache.deleteOldStapleFiles()
-			log.Printf("[INFO][%s] Done checking OCSP staples", certCache.storage)
+			log.Printf("[INFO][cache:%p] Scanning for stale OCSP staples", certCache)
+			certCache.updateOCSPStaples(ctx)
+			log.Printf("[INFO][cache:%p] Done checking OCSP staples", certCache)
 		case <-certCache.stopChan:
 			renewalTicker.Stop()
 			ocspTicker.Stop()
-			log.Printf("[INFO][%s] Stopped certificate maintenance routine", certCache.storage)
+			// TODO: stop any in-progress maintenance operations and clear locks we made
+			log.Printf("[INFO][cache:%p] Stopped certificate maintenance routine", certCache)
+			close(certCache.doneChan)
 			return
 		}
 	}
@@ -61,8 +68,13 @@ func (certCache *Cache) maintainAssets() {
 // RenewManagedCertificates renews managed certificates,
 // including ones loaded on-demand. Note that this is done
 // automatically on a regular basis; normally you will not
-// need to call this.
-func (certCache *Cache) RenewManagedCertificates(interactive bool) error {
+// need to call this. This method assumes non-interactive
+// mode (i.e. operating in the background).
+func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
+	// configs will hold a map of certificate name to the config
+	// to use when managing that certificate
+	configs := make(map[string]*Config)
+
 	// we use the queues for a very important reason: to do any and all
 	// operations that could require an exclusive write lock outside
 	// of the read lock! otherwise we get a deadlock, yikes. in other
@@ -73,11 +85,6 @@ func (certCache *Cache) RenewManagedCertificates(interactive bool) error {
 
 	certCache.mu.RLock()
 	for certKey, cert := range certCache.cache {
-		if len(cert.configs) == 0 {
-			// this is bad if this happens, probably a programmer error (oops)
-			log.Printf("[ERROR] No associated TLS config for certificate with names %v; unable to manage", cert.Names)
-			continue
-		}
 		if !cert.managed {
 			continue
 		}
@@ -89,13 +96,26 @@ func (certCache *Cache) RenewManagedCertificates(interactive bool) error {
 			continue
 		}
 
+		// get the config associated with this certificate
+		cfg, err := certCache.getConfig(cert)
+		if err != nil {
+			log.Printf("[ERROR] Getting configuration to manage certificate for names %v; unable to renew: %v", cert.Names, err)
+			continue
+		}
+		if cfg == nil {
+			// this is bad if this happens, probably a programmer error (oops)
+			log.Printf("[ERROR] No configuration associated with certificate for names %v; unable to manage", cert.Names)
+			continue
+		}
+		configs[cert.Names[0]] = cfg
+
 		// if time is up or expires soon, we need to try to renew it
-		if cert.NeedsRenewal() {
+		if cert.NeedsRenewal(cfg) {
 			// see if the certificate in storage has already been renewed, possibly by another
 			// instance that didn't coordinate with this one; if so, just load it (this
 			// might happen if another instance already renewed it - kinda sloppy but checking disk
 			// first is a simple way to possibly drastically reduce rate limit problems)
-			storedCertExpiring, err := managedCertInStorageExpiresSoon(cert)
+			storedCertExpiring, err := cfg.managedCertInStorageExpiresSoon(cert)
 			if err != nil {
 				// hmm, weird, but not a big deal, maybe it was deleted or something
 				log.Printf("[NOTICE] Error while checking if certificate for %v in storage is also expiring soon: %v",
@@ -123,12 +143,13 @@ func (certCache *Cache) RenewManagedCertificates(interactive bool) error {
 		log.Printf("[INFO] Certificate for %v expires in %v, but is already renewed in storage; reloading stored certificate",
 			oldCert.Names, timeLeft)
 
-		err := certCache.reloadManagedCertificate(oldCert)
+		cfg := configs[oldCert.Names[0]]
+
+		// crucially, this happens OUTSIDE a lock on the certCache
+		err := cfg.reloadManagedCertificate(oldCert)
 		if err != nil {
-			if interactive {
-				return err // operator is present, so report error immediately
-			}
 			log.Printf("[ERROR] Loading renewed certificate: %v", err)
+			continue
 		}
 	}
 
@@ -137,28 +158,18 @@ func (certCache *Cache) RenewManagedCertificates(interactive bool) error {
 		timeLeft := oldCert.NotAfter.Sub(time.Now().UTC())
 		log.Printf("[INFO] Certificate for %v expires in %v; attempting renewal", oldCert.Names, timeLeft)
 
+		cfg := configs[oldCert.Names[0]]
+
 		// Get the name which we should use to renew this certificate;
 		// we only support managing certificates with one name per cert,
 		// so this should be easy.
 		renewName := oldCert.Names[0]
 
-		// perform renewal
-		err := oldCert.configs[0].RenewCert(renewName, interactive)
+		// perform renewal - crucially, this happens OUTSIDE a lock on certCache
+		err := cfg.RenewCert(ctx, renewName, false)
 		if err != nil {
-			if interactive {
-				// Certificate renewal failed and the operator is present. See a discussion about
-				// this in issue mholt/caddy#642. For a while, we only stopped if the certificate
-				// was expired, but in reality, there is no difference between reporting it now
-				// versus later, except that there's somebody present to deal withit right now.
-				// Follow-up: See issue mholt/caddy#1680. Only fail in this case if the certificate
-				// is dangerously close to expiration.
-				timeLeft := oldCert.NotAfter.Sub(time.Now().UTC())
-				if timeLeft < oldCert.configs[0].RenewDurationBeforeAtStartup {
-					return err
-				}
-			}
-			log.Printf("[ERROR] %v", err)
-			if oldCert.configs[0].OnDemand != nil {
+			log.Printf("[ERROR][%s] %v", renewName, err)
+			if cfg.OnDemand != nil {
 				// loaded dynamically, remove dynamically
 				deleteQueue = append(deleteQueue, oldCert)
 			}
@@ -167,30 +178,19 @@ func (certCache *Cache) RenewManagedCertificates(interactive bool) error {
 
 		// successful renewal, so update in-memory cache by loading
 		// renewed certificate so it will be used with handshakes
-		err = certCache.reloadManagedCertificate(oldCert)
+		err = cfg.reloadManagedCertificate(oldCert)
 		if err != nil {
-			if interactive {
-				return err // operator is present, so report error immediately
-			}
-			log.Printf("[ERROR] %v", err)
+			log.Printf("[ERROR][%s] %v", renewName, err)
+			continue
 		}
 	}
 
 	// Deletion queue
+	certCache.mu.Lock()
 	for _, cert := range deleteQueue {
-		certCache.mu.Lock()
-		// remove any pointers to this certificate from Configs
-		for _, cfg := range cert.configs {
-			for name, certKey := range cfg.certificates {
-				if certKey == cert.Hash {
-					delete(cfg.certificates, name)
-				}
-			}
-		}
-		// then delete the certificate from the cache
-		delete(certCache.cache, cert.Hash)
-		certCache.mu.Unlock()
+		certCache.removeCertificate(cert)
 	}
+	certCache.mu.Unlock()
 
 	return nil
 }
@@ -201,35 +201,61 @@ func (certCache *Cache) RenewManagedCertificates(interactive bool) error {
 // OCSP maintenance strives to abide the relevant points on
 // Ryan Sleevi's recommendations for good OCSP support:
 // https://gist.github.com/sleevi/5efe9ef98961ecfb4da8
-func (certCache *Cache) updateOCSPStaples() {
-	// Create a temporary place to store updates
-	// until we release the potentially long-lived
-	// read lock and use a short-lived write lock
-	// on the certificate cache.
+func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
+	// temporary structures to store updates or tasks
+	// so that we can keep our locks short-lived
 	type ocspUpdate struct {
 		rawBytes []byte
 		parsed   *ocsp.Response
 	}
+	type updateQueueEntry struct {
+		cert           Certificate
+		certHash       string
+		lastNextUpdate time.Time
+	}
 	updated := make(map[string]ocspUpdate)
+	var updateQueue []updateQueueEntry
+	var renewQueue []Certificate
+	configs := make(map[string]*Config)
 
+	// obtain brief read lock during our scan to see which staples need updating
 	certCache.mu.RLock()
 	for certHash, cert := range certCache.cache {
 		// no point in updating OCSP for expired certificates
 		if time.Now().After(cert.NotAfter) {
 			continue
 		}
-
 		var lastNextUpdate time.Time
-		if cert.OCSP != nil {
-			lastNextUpdate = cert.OCSP.NextUpdate
-			if freshOCSP(cert.OCSP) {
+		if cert.ocsp != nil {
+			lastNextUpdate = cert.ocsp.NextUpdate
+			if freshOCSP(cert.ocsp) {
 				continue // no need to update staple if ours is still fresh
 			}
 		}
+		updateQueue = append(updateQueue, updateQueueEntry{cert, certHash, lastNextUpdate})
+	}
+	certCache.mu.RUnlock()
 
-		err := certCache.stapleOCSP(&cert, nil)
+	// perform updates outside of any lock on certCache
+	for _, qe := range updateQueue {
+		cert := qe.cert
+		certHash := qe.certHash
+		lastNextUpdate := qe.lastNextUpdate
+
+		cfg, err := certCache.getConfig(cert)
 		if err != nil {
-			if cert.OCSP != nil {
+			log.Printf("[ERROR] Getting configuration to manage OCSP for certificate with names %v; unable to refresh: %v", cert.Names, err)
+			continue
+		}
+		if cfg == nil {
+			// this is bad if this happens, probably a programmer error (oops)
+			log.Printf("[ERROR] No configuration associated with certificate for names %v; unable to manage OCSP", cert.Names)
+			continue
+		}
+
+		ocspResp, err := stapleOCSP(cfg.Storage, &cert, nil)
+		if err != nil {
+			if cert.ocsp != nil {
 				// if there was no staple before, that's fine; otherwise we should log the error
 				log.Printf("[ERROR] Checking OCSP: %v", err)
 			}
@@ -239,35 +265,89 @@ func (certCache *Cache) updateOCSPStaples() {
 		// By this point, we've obtained the latest OCSP response.
 		// If there was no staple before, or if the response is updated, make
 		// sure we apply the update to all names on the certificate.
-		if cert.OCSP != nil && (lastNextUpdate.IsZero() || lastNextUpdate != cert.OCSP.NextUpdate) {
+		if cert.ocsp != nil && (lastNextUpdate.IsZero() || lastNextUpdate != cert.ocsp.NextUpdate) {
 			log.Printf("[INFO] Advancing OCSP staple for %v from %s to %s",
-				cert.Names, lastNextUpdate, cert.OCSP.NextUpdate)
-			updated[certHash] = ocspUpdate{rawBytes: cert.Certificate.OCSPStaple, parsed: cert.OCSP}
+				cert.Names, lastNextUpdate, cert.ocsp.NextUpdate)
+			updated[certHash] = ocspUpdate{rawBytes: cert.Certificate.OCSPStaple, parsed: cert.ocsp}
+		}
+
+		// If a managed certificate was revoked, we should attempt
+		// to replace it with a new one. If that fails, oh well.
+		if cert.managed && ocspResp.Status == ocsp.Revoked && len(cert.Names) > 0 {
+			renewQueue = append(renewQueue, cert)
+			configs[cert.Names[0]] = cfg
 		}
 	}
-	certCache.mu.RUnlock()
 
 	// These write locks should be brief since we have all the info we need now.
 	for certKey, update := range updated {
 		certCache.mu.Lock()
 		cert := certCache.cache[certKey]
-		cert.OCSP = update.parsed
+		cert.ocsp = update.parsed
 		cert.Certificate.OCSPStaple = update.rawBytes
 		certCache.cache[certKey] = cert
 		certCache.mu.Unlock()
 	}
+
+	// We attempt to replace any certificates that were revoked.
+	// Crucially, this happens OUTSIDE a lock on the certCache.
+	for _, oldCert := range renewQueue {
+		log.Printf("[INFO] OCSP status for managed certificate %v (expiration=%s) is REVOKED; attempting to replace with new certificate",
+			oldCert.Names, oldCert.NotAfter)
+
+		renewName := oldCert.Names[0]
+		cfg := configs[renewName]
+
+		err := cfg.RenewCert(ctx, renewName, false)
+		if err != nil {
+			// probably better to not serve a revoked certificate at all
+			log.Printf("[ERROR] Obtaining new certificate for %v due to OCSP status of revoked: %v; removing from cache", oldCert.Names, err)
+			certCache.mu.Lock()
+			certCache.removeCertificate(oldCert)
+			certCache.mu.Unlock()
+			continue
+		}
+
+		err = cfg.reloadManagedCertificate(oldCert)
+		if err != nil {
+			log.Printf("[ERROR] After obtaining new certificate due to OCSP status of revoked: %v", err)
+			continue
+		}
+	}
 }
 
-// deleteOldStapleFiles deletes cached OCSP staples that have expired.
-// TODO: We should do this for long-expired certificates, too.
-func (certCache *Cache) deleteOldStapleFiles() {
-	ocspKeys, err := certCache.storage.List(prefixOCSP, false)
+// CleanStorageOptions specifies how to clean up a storage unit.
+type CleanStorageOptions struct {
+	OCSPStaples            bool
+	ExpiredCerts           bool
+	ExpiredCertGracePeriod time.Duration
+}
+
+// CleanStorage removes assets which are no longer useful,
+// according to opts.
+func CleanStorage(storage Storage, opts CleanStorageOptions) {
+	if opts.OCSPStaples {
+		err := deleteOldOCSPStaples(storage)
+		if err != nil {
+			log.Printf("[ERROR] Deleting old OCSP staples: %v", err)
+		}
+	}
+	if opts.ExpiredCerts {
+		err := deleteExpiredCerts(storage, opts.ExpiredCertGracePeriod)
+		if err != nil {
+			log.Printf("[ERROR] Deleting expired certificates: %v", err)
+		}
+	}
+}
+
+func deleteOldOCSPStaples(storage Storage) error {
+	ocspKeys, err := storage.List(prefixOCSP, false)
 	if err != nil {
 		// maybe just hasn't been created yet; no big deal
-		return
+		return nil
 	}
 	for _, key := range ocspKeys {
-		ocspBytes, err := certCache.storage.Load(key)
+		ocspBytes, err := storage.Load(key)
 		if err != nil {
 			log.Printf("[ERROR] While deleting old OCSP staples, unable to load staple file: %v", err)
 			continue
@@ -275,7 +355,7 @@ func (certCache *Cache) deleteOldStapleFiles() {
 		resp, err := ocsp.ParseResponse(ocspBytes, nil)
 		if err != nil {
 			// contents are invalid; delete it
-			err = certCache.storage.Delete(key)
+			err = storage.Delete(key)
 			if err != nil {
 				log.Printf("[ERROR] Purging corrupt staple file %s: %v", key, err)
 			}
@@ -283,25 +363,95 @@ func (certCache *Cache) deleteOldStapleFiles() {
 		}
 		if time.Now().After(resp.NextUpdate) {
 			// response has expired; delete it
-			err = certCache.storage.Delete(key)
+			err = storage.Delete(key)
 			if err != nil {
 				log.Printf("[ERROR] Purging expired staple file %s: %v", key, err)
 			}
 		}
 	}
+	return nil
+}
+
+func deleteExpiredCerts(storage Storage, gracePeriod time.Duration) error {
+	acmeKeys, err := storage.List(prefixACME, false)
+	if err != nil {
+		// maybe just hasn't been created yet; no big deal
+		return nil
+	}
+
+	for _, acmeKey := range acmeKeys {
+		siteKeys, err := storage.List(path.Join(acmeKey, "sites"), false)
+		if err != nil {
+			continue
+		}
+
+		for _, siteKey := range siteKeys {
+			siteAssets, err := storage.List(siteKey, false)
+			if err != nil {
+				log.Printf("[INFO] Listing contents of %s: %v", siteKey, err)
+				continue
+			}
+
+			for _, assetKey := range siteAssets {
+				if path.Ext(assetKey) != ".crt" {
+					continue
+				}
+
+				certFile, err := storage.Load(assetKey)
+				if err != nil {
+					return fmt.Errorf("loading certificate file %s: %v", assetKey, err)
+				}
+				block, _ := pem.Decode(certFile)
+				if block == nil || block.Type != "CERTIFICATE" {
+					return fmt.Errorf("certificate file %s does not contain PEM-encoded certificate", assetKey)
+				}
+				cert, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					return fmt.Errorf("certificate file %s is malformed; error parsing PEM: %v", assetKey, err)
+				}
+
+				if expiredTime := time.Since(cert.NotAfter); expiredTime >= gracePeriod {
+					log.Printf("[INFO] Certificate %s expired %s ago; cleaning up", assetKey, expiredTime)
+					baseName := strings.TrimSuffix(assetKey, ".crt")
+					for _, relatedAsset := range []string{
+						assetKey,
+						baseName + ".key",
+						baseName + ".json",
+					} {
+						log.Printf("[INFO] Deleting %s because resource expired", relatedAsset)
+						err := storage.Delete(relatedAsset)
+						if err != nil {
+							log.Printf("[ERROR] Cleaning up asset related to expired certificate for %s: %s: %v",
+								baseName, relatedAsset, err)
+						}
+					}
+				}
+			}
+
+			// update listing; if folder is empty, delete it
+			siteAssets, err = storage.List(siteKey, false)
+			if err != nil {
+				continue
+			}
+			if len(siteAssets) == 0 {
+				log.Printf("[INFO] Deleting %s because key is empty", siteKey)
+				err := storage.Delete(siteKey)
+				if err != nil {
+					return fmt.Errorf("deleting empty site folder %s: %v", siteKey, err)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 const (
-	// DefaultRenewInterval is how often to check certificates for renewal.
-	DefaultRenewInterval = 12 * time.Hour
+	// DefaultRenewCheckInterval is how often to check certificates for renewal.
+	DefaultRenewCheckInterval = 12 * time.Hour
 
 	// DefaultRenewDurationBefore is how long before expiration to renew certificates.
 	DefaultRenewDurationBefore = (24 * time.Hour) * 30
 
-	// DefaultRenewDurationBeforeAtStartup is how long before expiration to require
-	// a renewed certificate when the process is first starting up (see mholt/caddy#1680).
-	DefaultRenewDurationBeforeAtStartup = (24 * time.Hour) * 7
-
-	// DefaultOCSPInterval is how often to check if OCSP stapling needs updating.
-	DefaultOCSPInterval = 1 * time.Hour
+	// DefaultOCSPCheckInterval is how often to check if OCSP stapling needs updating.
+	DefaultOCSPCheckInterval = 1 * time.Hour
 )

@@ -5,9 +5,8 @@
 <p align="center">The same library used by the <a href="https://caddyserver.com">Caddy Web Server</a></p>
 <p align="center">
 	<a href="https://godoc.org/github.com/mholt/certmagic"><img src="https://img.shields.io/badge/godoc-reference-blue.svg"></a>
-	<a href="https://travis-ci.org/mholt/certmagic"><img src="https://img.shields.io/travis/mholt/certmagic.svg?label=linux+build"></a>
-	<a href="https://ci.appveyor.com/project/mholt/certmagic"><img src="https://img.shields.io/appveyor/ci/mholt/certmagic.svg?label=windows+build"></a>
-	<!--<a href="https://sourcegraph.com/github.com/mholt/certmagic?badge" title="certmagic on Sourcegraph"><img src="https://sourcegraph.com/github.com/mholt/certmagic/-/badge.svg" alt="certmagic on Sourcegraph"></a>-->
+	<a href="https://dev.azure.com/mholt-dev/CertMagic/_build"><img src="https://img.shields.io/azure-devops/build/mholt-dev/3511431f-630c-43ac-833f-be949b4f4ee7/3.svg?label=cross-platform%20tests"></a>
+	<a href="https://sourcegraph.com/github.com/mholt/certmagic?badge"><img src="https://sourcegraph.com/github.com/mholt/certmagic/-/badge.svg"></a>
 </p>
 
 
@@ -33,7 +32,7 @@ certmagic.HTTPS([]string{"example.com"}, mux)
 
 That line of code will serve your HTTP router `mux` over HTTPS, complete with HTTP->HTTPS redirects. It obtains and renews the TLS certificates. It staples OCSP responses for greater privacy and security. As long as your domain name points to your server, CertMagic will keep its connections secure.
 
-Compared to other ACME client libraries for Go, only CertMagic supports the full suite of ACME features, and no other library will ever match CertMagic's maturity and reliability.
+Compared to other ACME client libraries for Go, only CertMagic supports the full suite of ACME features, and no other library matches CertMagic's maturity and reliability.
 
 
 
@@ -57,6 +56,7 @@ CertMagic - Automatic HTTPS using Let's Encrypt
 		- [The `Config` type](#the-config-type)
 		- [Defaults](#defaults)
 		- [Providing an email address](#providing-an-email-address)
+		- [Rate limiting](#rate-limiting)
 	- [Development and testing](#development-and-testing)
 	- [Examples](#examples)
 		- [Serving HTTP handlers with HTTPS](#serving-http-handlers-with-https)
@@ -84,17 +84,17 @@ CertMagic - Automatic HTTPS using Let's Encrypt
 - Full control over almost every aspect of the system
 - HTTP->HTTPS redirects (for HTTP applications)
 - Solves all 3 ACME challenges: HTTP, TLS-ALPN, and DNS
-- Over 50 DNS providers work out-of-the-box (powered by [lego](https://github.com/xenolf/lego)!)
+	- Challenge randomization and rotation
+	- Robust retries
+- Over 50 DNS providers work out-of-the-box (powered by [lego](https://github.com/go-acme/lego)!)
 - Pluggable storage implementations (default: file system)
 - Wildcard certificates (requires DNS challenge)
 - OCSP stapling for each qualifying certificate ([done right](https://gist.github.com/sleevi/5efe9ef98961ecfb4da8#gistcomment-2336055))
 - Distributed solving of all challenges (works behind load balancers)
 - Supports "on-demand" issuance of certificates (during TLS handshakes!)
-	- Custom decision functions
-	- Hostname whitelist
-	- Ask an external URL
-	- Rate limiting
-- Optional event hooks to observe internal behaviors
+	- Caddy / CertMagic pioneered this technology
+	- Custom decision functions to regulate on-demand behavior
+- Optional event hooks for observation
 - Works with any certificate authority (CA) compliant with the ACME specification
 - Certificate revocation (please, only if private key is compromised)
 - Must-Staple (optional; not default)
@@ -122,7 +122,7 @@ CertMagic - Automatic HTTPS using Let's Encrypt
 ## Installation
 
 ```bash
-$ go get -u github.com/mholt/certmagic
+$ go get github.com/mholt/certmagic
 ```
 
 
@@ -136,18 +136,29 @@ This library uses Let's Encrypt by default, but you can use any certificate auth
 
 #### The `Config` type
 
-The `certmagic.Config` struct is how you can wield the power of this fully armed and operational battle station. However, an empty config is _not_ a valid one! In time, you will learn to use the force of `certmagic.New(certmagic.Config{...})` as I have.
+The `certmagic.Config` struct is how you can wield the power of this fully armed and operational battle station. However, an empty/uninitialized `Config` is _not_ a valid one! In time, you will learn to use the force of `certmagic.NewDefault()` as I have.
 
 #### Defaults
 
-For every field in the `Config` struct, there is a corresponding package-level variable you can set as a default value. These defaults will be used when you call any of the high-level convenience functions like `HTTPS()` or `Listen()` or anywhere else a default `Config` is used. They are also used for any `Config` fields that are zero-valued when you call `New()`.
+The default `Config` value is called `certmagic.Default`. Change its fields to suit your needs, then call `certmagic.NewDefault()` when you need a valid `Config` value. In other words, `certmagic.Default` is a template and is not valid for use directly.
 
-You can set these values easily, for example: `certmagic.Email = ...` sets the email address to use for everything unless you explicitly override it in a Config.
+You can set the default values easily, for example: `certmagic.Default.Email = ...`.
+
+The high-level functions in this package (`HTTPS()`, `Listen()`, `ManageSync()`, and `ManageAsync()`) use the default config exclusively. This is how most of you will interact with the package. This is suitable when all your certificates are managed the same way. However, if you need to manage certificates differently depending on their name, you will need to make your own cache and configs (keep reading).
 
 
 #### Providing an email address
 
-Although not strictly required, this is highly recommended best practice. It allows you to receive expiration emails if your certificates are expiring for some reason, and also allows the CA's engineers to potentially get in touch with you if something is wrong. I recommend setting `certmagic.Email` or always setting the `Email` field of the `Config` struct.
+Although not strictly required, this is highly recommended best practice. It allows you to receive expiration emails if your certificates are expiring for some reason, and also allows the CA's engineers to potentially get in touch with you if something is wrong. I recommend setting `certmagic.Default.Email` or always setting the `Email` field of a new `Config` struct.
+
+
+#### Rate limiting
+
+To avoid firehosing the CA's servers, CertMagic has built-in rate limiting. Currently, its default limit is up to 10 transactions (obtain or renew) every 1 minute (sliding window). This can be changed by setting the `RateLimitOrders` and `RateLimitOrdersWindow` variables, if desired.
+
+The CA may still enforce their own rate limits, and there's nothing (well, nothing ethical) CertMagic can do to bypass them for you.
+
+Additionally, CertMagic will retry failed validations with exponential backoff for up to 30 days, with a maximum of 1 day between attempts. (An "attempt" means trying each enabled challenge type twice.)
 
 
 ### Development and Testing
@@ -156,7 +167,7 @@ Note that Let's Encrypt imposes [strict rate limits](https://letsencrypt.org/doc
 
 While developing your application and testing it, use [their staging endpoint](https://letsencrypt.org/docs/staging-environment/) which has much higher rate limits. Even then, don't hammer it: but it's much safer for when you're testing. When deploying, though, use their production CA because their staging CA doesn't issue trusted certificates.
 
-To use staging, set `certmagic.CA = certmagic.LetsEncryptStagingCA` or set `CA` of every `Config` struct.
+To use staging, set `certmagic.Default.CA = certmagic.LetsEncryptStagingCA` or set `CA` of every `Config` struct.
 
 
 
@@ -164,18 +175,22 @@ To use staging, set `certmagic.CA = certmagic.LetsEncryptStagingCA` or set `CA` 
 
 There are many ways to use this library. We'll start with the highest-level (simplest) and work down (more control).
 
+All these high-level examples use `certmagic.Default` for the config and the default cache and storage for serving up certificates.
+
 First, we'll follow best practices and do the following:
 
 ```go
 // read and agree to your CA's legal documents
-certmagic.Agreed = true
+certmagic.Default.Agreed = true
 
 // provide an email address
-certmagic.Email = "you@yours.com"
+certmagic.Default.Email = "you@yours.com"
 
 // use the staging endpoint while we're developing
-certmagic.CA = certmagic.LetsEncryptStagingCA
+certmagic.Default.CA = certmagic.LetsEncryptStagingCA
 ```
+
+For fully-functional program examples, check out [this Twitter thread](https://twitter.com/mholt6/status/1073103805112147968) (or read it [unrolled into a single post](https://threadreaderapp.com/thread/1073103805112147968.html)). (Note that the package API has changed slightly since these posts.)
 
 
 #### Serving HTTP handlers with HTTPS
@@ -211,10 +226,24 @@ if err != nil {
 
 #### Advanced use
 
-For more control, you'll make and use a `Config` like so:
+For more control (particularly, if you need a different way of managing each certificate), you'll make and use a `Cache` and a `Config` like so:
 
 ```go
-magic := certmagic.New(certmagic.Config{
+cache := certmagic.NewCache(certmagic.CacheOptions{
+	GetConfigForCert: func(cert certmagic.Certificate) (*certmagic.Config, error) {
+		// do whatever you need to do to get the right
+		// configuration for this certificate; keep in
+		// mind that this config value is used as a
+		// template, and will be completed with any
+		// defaults that are set in the Default config
+		return certmagic.Config{
+			// ...
+		}), nil
+	},
+	...
+})
+
+magic := certmagic.New(cache, certmagic.Config{
 	CA:     certmagic.LetsEncryptStagingCA,
 	Email:  "you@yours.com",
 	Agreed: true,
@@ -222,7 +251,7 @@ magic := certmagic.New(certmagic.Config{
 })
 
 // this obtains certificates or renews them if necessary
-err := magic.Manage([]string{"example.com", "sub.example.com"})
+err := magic.ManageSync([]string{"example.com", "sub.example.com"})
 if err != nil {
 	return err
 }
@@ -230,6 +259,8 @@ if err != nil {
 // to use its certificates and solve the TLS-ALPN challenge,
 // you can get a TLS config to use in a TLS listener!
 tlsConfig := magic.TLSConfig()
+
+//// OR ////
 
 // if you already have a TLS config you don't want to replace,
 // we can simply set its GetCertificate field and append the
@@ -243,23 +274,12 @@ myTLSConfig.NextProtos = append(myTLSConfig.NextProtos, tlsalpn01.ACMETLS1Protoc
 httpMux = magic.HTTPChallengeHandler(httpMux)
 ```
 
-Great! This example grants you much more flexibility for advanced programs. However, _the vast majority of you will only use the high-level functions described earlier_, especially since you can still customize them by setting the package-level defaults.
-
-If you want to use the default configuration but you still need a `certmagic.Config`, you can call `certmagic.Manage()` directly to get one:
-
-```go
-magic, err := certmagic.Manage([]string{"example.com"})
-if err != nil {
-	return err
-}
-```
-
-And then it's the same as above, as if you had made the `Config` yourself.
+Great! This example grants you much more flexibility for advanced programs. However, _the vast majority of you will only use the high-level functions described earlier_, especially since you can still customize them by setting the package-level `Default` config.
 
 
 ### Wildcard certificates
 
-At time of writing (December 2018), Let's Encrypt only issues wildcard certificates with the DNS challenge.
+At time of writing (December 2018), Let's Encrypt only issues wildcard certificates with the DNS challenge. You can easily enable the DNS challenge with CertMagic for numerous providers (see the relevant section in the docs).
 
 
 ### Behind a load balancer (or in a cluster)
@@ -281,7 +301,7 @@ If you're using the high-level convenience functions like `HTTPS()`, `Listen()`,
 
 The HTTP and TLS-ALPN challenges are the defaults because they don't require configuration from you, but they require that your server is accessible from external IPs on low ports. If that is not possible in your situation, you can enable the DNS challenge, which will disable the HTTP and TLS-ALPN challenges and use the DNS challenge exclusively.
 
-Technically, only one challenge needs to be enabled for things to work, but using multiple is good for reliability in case a challenge is discontinued by the CA. This happened to the TLS-SNI challenge in early 2018&mdash;many popular ACME clients such as Traefik and Autocert broke, resulting in downtime for some sites, until new releases were made and patches deployed, because they used only one challenge; Caddy, however&mdash;this library's forerunner&mdash;was unaffected because it also used the HTTP challenge. If multiple challenges are enabled, they are chosen randomly to help prevent false reliance on a single challenge type.
+Technically, only one challenge needs to be enabled for things to work, but using multiple is good for reliability in case a challenge is discontinued by the CA. This happened to the TLS-SNI challenge in early 2018&mdash;many popular ACME clients such as Traefik and Autocert broke, resulting in downtime for some sites, until new releases were made and patches deployed, because they used only one challenge; Caddy, however&mdash;this library's forerunner&mdash;was unaffected because it also used the HTTP challenge. If multiple challenges are enabled, they are chosen randomly to help prevent false reliance on a single challenge type. And if one fails, any remaining enabled challenges are tried before giving up.
 
 
 ### HTTP Challenge
@@ -346,22 +366,22 @@ ln, err := tls.Listen("tcp", ":443", myTLSConfig)
 
 The DNS challenge is perhaps the most useful challenge because it allows you to obtain certificates without your server needing to be publicly accessible on the Internet, and it's the only challenge by which Let's Encrypt will issue wildcard certificates.
 
-This challenge works by setting a special record in the domain's zone. To do this automatically, your DNS provider needs to offer an API by which changes can be made to domain names, and the changes need to take effect immediately for best results. CertMagic supports [all of lego's DNS provider implementations](https://github.com/xenolf/lego/tree/master/providers/dns)! All of them clean up the temporary record after the challenge completes.
+This challenge works by setting a special record in the domain's zone. To do this automatically, your DNS provider needs to offer an API by which changes can be made to domain names, and the changes need to take effect immediately for best results. CertMagic supports [all of lego's DNS provider implementations](https://github.com/go-acme/lego/tree/master/providers/dns)! All of them clean up the temporary record after the challenge completes.
 
-To enable it, just set the `DNSProvider` field on a `certmagic.Config` struct, or set the default `certmagic.DNSProvider` variable. For example, if my domains' DNS was served by DNSimple (they're great, by the way) and I set my DNSimple API credentials in environment variables:
+To enable it, just set the `DNSProvider` field on a `certmagic.Config` struct, or set the default `certmagic.DNSProvider` variable. For example, if my domains' DNS was served by DNSimple and I set my DNSimple API credentials in environment variables:
 
 ```go
-import "github.com/xenolf/lego/providers/dns/dnsimple"
+import "github.com/go-acme/lego/v3/providers/dns/dnsimple"
 
-provider, err := dnsimple.NewProvider()
+provider, err := dnsimple.NewDNSProvider()
 if err != nil {
 	return err
 }
 
-certmagic.DNSProvider = provider
+certmagic.Default.DNSProvider = provider
 ```
 
-Now the DNS challenge will be used by default, and I can obtain certificates for wildcard domains. See the [godoc documentation for the provider you're using](https://godoc.org/github.com/xenolf/lego/providers/dns#pkg-subdirectories) to learn how to configure it. Most can be configured by env variables or by passing in a config struct. If you pass a config struct instead of using env variables, you will probably need to set some other defaults (that's just how lego works, currently):
+Now the DNS challenge will be used by default, and I can obtain certificates for wildcard domains. See the [godoc documentation for the provider you're using](https://godoc.org/github.com/go-acme/lego/providers/dns#pkg-subdirectories) to learn how to configure it. Most can be configured by env variables or by passing in a config struct. If you pass a config struct instead of using env variables, you will probably need to set some other defaults (that's just how lego works, currently):
 
 ```go
 PropagationTimeout: dns01.DefaultPollingInterval,
@@ -374,43 +394,49 @@ Enabling the DNS challenge disables the other challenges for that `certmagic.Con
 
 ## On-Demand TLS
 
-Normally, certificates are obtained and renewed before a listener starts serving, and then those certificates are maintained throughout the lifetime of the program. In other words, the certificate names are static. But sometimes you don't know all the names ahead of time. This is where On-Demand TLS shines.
+Normally, certificates are obtained and renewed before a listener starts serving, and then those certificates are maintained throughout the lifetime of the program. In other words, the certificate names are static. But sometimes you don't know all the names ahead of time, or you don't want to manage all the certificates up front. This is where On-Demand TLS shines.
 
-Originally invented for use in Caddy (which was the first program to use such technology), On-Demand TLS makes it possible and easy to serve certificates for arbitrary names during the lifetime of the server. When a TLS handshake is received, CertMagic will read the Server Name Indication (SNI) value and either load and present that certificate in the ServerHello, or if one does not exist, it will obtain it from a CA right then-and-there.
+Originally invented for use in Caddy (which was the first program to use such technology), On-Demand TLS makes it possible and easy to serve certificates for arbitrary or specific names during the lifetime of the server. When a TLS handshake is received, CertMagic will read the Server Name Indication (SNI) value and either load and present that certificate in the ServerHello, or if one does not exist, it will obtain it from a CA right then-and-there.
 
-Of course, this has some obvious security implications. You don't want to DoS a CA or allow arbitrary clients to fill your storage with spammy TLS handshakes. That's why, in order to enable On-Demand issuance, you'll need to set some limits or some policy to allow getting a certificate.
+Of course, this has some obvious security implications. You don't want to DoS a CA or allow arbitrary clients to fill your storage with spammy TLS handshakes. That's why, when you enable On-Demand issuance, you should set limits or policy to allow getting certificates. CertMagic has an implicit whitelist built-in which is sufficient for nearly everyone, but also has a more advanced way to control on-demand issuance.
 
-CertMagic provides several ways to enforce decision policies for On-Demand TLS, in descending order of priority:
-
-- A generic function that you write which will decide whether to allow the certificate request
-- A name whitelist
-- The ability to make an HTTP request to a URL for permission
-- Rate limiting
-
-The simplest way to enable On-Demand issuance is to set the OnDemand field of a Config (or the default package-level value):
+The simplest way to enable on-demand issuance is to set the OnDemand field of a Config (or the default package-level value):
 
 ```go
-certmagic.OnDemand = &certmagic.OnDemandConfig{MaxObtain: 5}
+certmagic.Default.OnDemand = new(certmagic.OnDemandConfig)
 ```
 
-This allows only 5 certificates to be requested and is the simplest way to enable On-Demand TLS, but is the least recommended. It prevents abuse, but only in the least helpful way.
+By setting this to a non-nil value, on-demand TLS is enabled for that config. For convenient security, CertMagic's high-level abstraction functions such as `HTTPS()`, `TLS()`, `ManageSync()`, `ManageAsync()`, and `Listen()` (which all accept a list of domain names) will whitelist those names automatically so only certificates for those names can be obtained when using the Default config. Usually this is sufficient for most users.
 
-The [godoc](https://godoc.org/github.com/mholt/certmagic#OnDemandConfig) describes how to use the other policies, all of which are much more recommended! :)
+However, if you require advanced control over which domains can be issued certificates on-demand (for example, if you do not know which domain names you are managing, or just need to defer their operations until later), you should implement your own DecisionFunc:
 
-If `OnDemand` is set and `Manage()` is called, then the names given to `Manage()` will be whitelisted rather than obtained right away.
+```go
+// if the decision function returns an error, a certificate
+// may not be obtained for that name at that time
+certmagic.Default.OnDemand = &certmagic.OnDemandConfig{
+	DecisionFunc: func(name string) error {
+		if name != "example.com" {
+			return fmt.Errorf("not allowed")
+		}
+		return nil
+	},
+}
+```
+
+The [godoc](https://godoc.org/github.com/mholt/certmagic#OnDemandConfig) describes how to use this in full detail, so please check it out!
 
 
 ## Storage
 
 CertMagic relies on storage to store certificates and other TLS assets (OCSP staple cache, coordinating locks, etc). Persistent storage is a requirement when using CertMagic: ephemeral storage will likely lead to rate limiting on the CA-side as CertMagic will always have to get new certificates.
 
-By default, CertMagic stores assets on the local file system in `$HOME/.local/share/certmagic` (and honors `$XDG_CACHE_HOME` if set). CertMagic will create the directory if it does not exist. If writes are denied, things will not be happy, so make sure CertMagic can write to it!
+By default, CertMagic stores assets on the local file system in `$HOME/.local/share/certmagic` (and honors `$XDG_DATA_HOME` if set). CertMagic will create the directory if it does not exist. If writes are denied, things will not be happy, so make sure CertMagic can write to it!
 
 The notion of a "cluster" or "fleet" of instances that may be serving the same site and sharing certificates, etc, is tied to storage. Simply, any instances that use the same storage facilities are considered part of the cluster. So if you deploy 100 instances of CertMagic behind a load balancer, they are all part of the same cluster if they share the same storage configuration. Sharing storage could be mounting a shared folder, or implementing some other distributed storage system such as a database server or KV store.
 
 The easiest way to change the storage being used is to set `certmagic.DefaultStorage` to a value that satisfies the [Storage interface](https://godoc.org/github.com/mholt/certmagic#Storage). Keep in mind that a valid `Storage` must be able to implement some operations atomically in order to provide locking and synchronization.
 
-If you write a Storage implementation, let us know and we'll add it to the project so people can find it!
+If you write a Storage implementation, please add it to the [project wiki](https://github.com/mholt/certmagic/wiki/Storage-Implementations) so people can find it!
 
 
 ## Cache
@@ -458,7 +484,7 @@ We welcome your contributions! Please see our **[contributing guidelines](https:
 
 ## Project History
 
-CertMagic is the core of Caddy's advanced TLS automation code, extracted into a library. The underlying ACME client implementation is [lego](https://github.com/xenolf/lego), which was originally developed for use in Caddy even before Let's Encrypt entered public beta in 2015.
+CertMagic is the core of Caddy's advanced TLS automation code, extracted into a library. The underlying ACME client implementation is [lego](https://github.com/go-acme/lego), which was originally developed for use in Caddy even before Let's Encrypt entered public beta in 2015.
 
 In the years since then, Caddy's TLS automation techniques have been widely adopted, tried and tested in production, and served millions of sites and secured trillions of connections.
 

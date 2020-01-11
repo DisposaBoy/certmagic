@@ -19,13 +19,15 @@ import (
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"hash/fnv"
 
-	"github.com/xenolf/lego/certificate"
+	"github.com/go-acme/lego/v3/certificate"
+	"github.com/klauspost/cpuid"
 )
 
 // encodePrivateKey marshals a EC or RSA private key into a PEM-encoded array of bytes.
@@ -117,20 +119,20 @@ func (cfg *Config) saveCertResource(cert *certificate.Resource) error {
 		},
 	}
 
-	return storeTx(cfg.certCache.storage, all)
+	return storeTx(cfg.Storage, all)
 }
 
 func (cfg *Config) loadCertResource(domain string) (certificate.Resource, error) {
 	var certRes certificate.Resource
-	certBytes, err := cfg.certCache.storage.Load(StorageKeys.SiteCert(cfg.CA, domain))
+	certBytes, err := cfg.Storage.Load(StorageKeys.SiteCert(cfg.CA, domain))
 	if err != nil {
 		return certRes, err
 	}
-	keyBytes, err := cfg.certCache.storage.Load(StorageKeys.SitePrivateKey(cfg.CA, domain))
+	keyBytes, err := cfg.Storage.Load(StorageKeys.SitePrivateKey(cfg.CA, domain))
 	if err != nil {
 		return certRes, err
 	}
-	metaBytes, err := cfg.certCache.storage.Load(StorageKeys.SiteMeta(cfg.CA, domain))
+	metaBytes, err := cfg.Storage.Load(StorageKeys.SiteMeta(cfg.CA, domain))
 	if err != nil {
 		return certRes, err
 	}
@@ -153,3 +155,34 @@ func hashCertificateChain(certChain [][]byte) string {
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
+
+// preferredDefaultCipherSuites returns an appropriate
+// cipher suite to use depending on hardware support
+// for AES-NI.
+//
+// See https://github.com/mholt/caddy/issues/1674
+func preferredDefaultCipherSuites() []uint16 {
+	if cpuid.CPU.AesNi() {
+		return defaultCiphersPreferAES
+	}
+	return defaultCiphersPreferChaCha
+}
+
+var (
+	defaultCiphersPreferAES = []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+	}
+	defaultCiphersPreferChaCha = []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+	}
+)

@@ -35,7 +35,10 @@ import (
 //
 // Errors here are not necessarily fatal, it could just be that the
 // certificate doesn't have an issuer URL.
-func (certCache *Cache) stapleOCSP(cert *Certificate, pemBundle []byte) error {
+//
+// If a status was received, it returns that status. Note that the
+// returned status is not always stapled to the certificate.
+func stapleOCSP(storage Storage, cert *Certificate, pemBundle []byte) (*ocsp.Response, error) {
 	if pemBundle == nil {
 		// we need a PEM encoding only for some function calls below
 		bundle := new(bytes.Buffer)
@@ -53,7 +56,7 @@ func (certCache *Cache) stapleOCSP(cert *Certificate, pemBundle []byte) error {
 	// First try to load OCSP staple from storage and see if
 	// we can still use it.
 	ocspStapleKey := StorageKeys.OCSPStaple(cert, pemBundle)
-	cachedOCSP, err := certCache.storage.Load(ocspStapleKey)
+	cachedOCSP, err := storage.Load(ocspStapleKey)
 	if err == nil {
 		resp, err := ocsp.ParseResponse(cachedOCSP, nil)
 		if err == nil {
@@ -69,7 +72,7 @@ func (certCache *Cache) stapleOCSP(cert *Certificate, pemBundle []byte) error {
 			// because we loaded it by name, whereas the maintenance routine
 			// just iterates the list of files, even if somehow a non-staple
 			// file gets in the folder. in this case we are sure it is corrupt.)
-			err := certCache.storage.Delete(ocspStapleKey)
+			err := storage.Delete(ocspStapleKey)
 			if err != nil {
 				log.Printf("[WARNING] Unable to delete invalid OCSP staple file: %v", err)
 			}
@@ -85,7 +88,7 @@ func (certCache *Cache) stapleOCSP(cert *Certificate, pemBundle []byte) error {
 			// not contain a link to an OCSP server. But we should log it anyway.
 			// There's nothing else we can do to get OCSP for this certificate,
 			// so we can return here with the error.
-			return fmt.Errorf("no OCSP stapling for %v: %v", cert.Names, ocspErr)
+			return nil, fmt.Errorf("no OCSP stapling for %v: %v", cert.Names, ocspErr)
 		}
 		gotNewOCSP = true
 	}
@@ -98,20 +101,20 @@ func (certCache *Cache) stapleOCSP(cert *Certificate, pemBundle []byte) error {
 			// uh oh, this OCSP response expires AFTER the certificate does, that's kinda bogus.
 			// it was the reason a lot of Symantec-validated sites (not Caddy) went down
 			// in October 2017. https://twitter.com/mattiasgeniar/status/919432824708648961
-			return fmt.Errorf("invalid: OCSP response for %v valid after certificate expiration (%s)",
+			return ocspResp, fmt.Errorf("invalid: OCSP response for %v valid after certificate expiration (%s)",
 				cert.Names, cert.NotAfter.Sub(ocspResp.NextUpdate))
 		}
 		cert.Certificate.OCSPStaple = ocspBytes
-		cert.OCSP = ocspResp
+		cert.ocsp = ocspResp
 		if gotNewOCSP {
-			err := certCache.storage.Store(ocspStapleKey, ocspBytes)
+			err := storage.Store(ocspStapleKey, ocspBytes)
 			if err != nil {
-				return fmt.Errorf("unable to write OCSP staple file for %v: %v", cert.Names, err)
+				return ocspResp, fmt.Errorf("unable to write OCSP staple file for %v: %v", cert.Names, err)
 			}
 		}
 	}
 
-	return nil
+	return ocspResp, nil
 }
 
 // getOCSPForCert takes a PEM encoded cert or cert bundle returning the raw OCSP response,
@@ -121,7 +124,7 @@ func (certCache *Cache) stapleOCSP(cert *Certificate, pemBundle []byte) error {
 // IssuingCertificateURL in the certificate. If the []byte and/or ocsp.Response return
 // values are nil, the OCSP status may be assumed OCSPUnknown.
 //
-// Borrowed from github.com/xenolf/lego
+// Borrowed from github.com/go-acme/lego
 func getOCSPForCert(bundle []byte) ([]byte, *ocsp.Response, error) {
 	// TODO: Perhaps this should be synchronized too, with a Locker?
 
